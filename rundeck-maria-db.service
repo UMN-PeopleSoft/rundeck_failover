@@ -1,0 +1,19 @@
+[Unit]
+Description=Maria DB for Rundeck
+Requires=network-online.service
+After=network-online.service
+AssertPathExists=/psoft/rundeck/db
+
+[Service]
+WorkingDirectory=/psoft/rundeck/db
+Environment="DEFAULT_SYSCONFDIR=/psoft/rundeck/db" 
+Environment="MYSQL_HOME=/psoft/rundeck/db"
+User=psoft
+Group=psoft
+ExecStartPre=/usr/bin/sync
+ExecStart=/usr/bin/mysqld_safe --defaults-file=${DEFAULT_SYSCONFDIR}/my.cnf
+ExecStartPost=/usr/libexec/mariadb-wait-ready $MAINPID
+TimeoutSec=300
+
+[Install]
+WantedBy=default.target

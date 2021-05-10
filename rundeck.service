@@ -1,0 +1,16 @@
+[Unit]
+Description=PSSA Rundeck
+Requires=network-online.service rundeck-maria-db.service
+After=network-online.service rundeck-maria-db.service
+AssertPathExists=/psoft/rundeck
+
+[Service]
+WorkingDirectory=/psoft/rundeck
+Environment="RDECK_BASE=/psoft/rundeck"
+User=psoft
+Group=psoft
+ExecStart=/psoft/rundeck/sbin/rundeckd
+Restart=always
+
+[Install]
+WantedBy=default.target
