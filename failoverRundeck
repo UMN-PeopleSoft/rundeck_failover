@@ -1,0 +1,166 @@
+#!/bin/env bash
+#
+################################################################################
+##
+## File Name   : failoverRundeck
+## Description : Failover to primary or secondary rundeck instance for TST or PRD
+## Author      : Nate Werner
+## Created     : 10/8/2020
+################################################################################
+## Syntax      : failoverRundeck -e <env> [-h]
+##
+## Parameters  :  -e   : Environment: tst or prd
+##                - h  : Help
+##
+## Example     : failoverRundeck -t 2 -e prd
+##                  Fails over to secondary prod Rundeck instance
+################################################################################
+
+# Global
+SSH_CMD="ssh -o StrictHostKeyChecking=no"
+
+# load needed libraries
+source security.sh
+
+## common functions
+function usageInfo()
+{
+   echo "Usage:"
+   echo "   failoverRundeck -e <env> [-h]"
+   echo "     Failover Rundeck to primary or secondary instance"
+   echo "     -e    : Environment to do failover on tst or prd"
+   echo "     -h        : Display this help"
+   echo
+   echo "Sample: syncRotateFile -t 2 -e prd"
+   echo
+   exit
+
+}
+
+######## Main program
+
+prd_pri_host="host-01"
+prd_sec_host="host-02"
+tst_pri_host="testhost-01"
+tst_sec_host="testhost-02"
+
+active_host=""
+backup_host=""
+active_path=/psoft/rundeck
+backup_path=/psoft/rundeck
+# NFS share folder for backups
+share_path=/psoft/admin/rundeck/prod
+# default env
+env="prd"
+
+rd_port=4440
+# secondary test Rundeck port, on same host, but different port
+rd_sec_port=4450
+active_port=$rd_port
+backup_port=$rd_port
+
+# get user's paramters
+while getopts ":he:" optname
+  do
+    case "$optname" in
+      "e")
+        env=$OPTARG
+        ;;
+      "h")
+        usageInfo
+        ;;
+      "?")
+        echo "Unknown option $OPTARG"
+        usageInfo
+        ;;
+      ":")
+        echo "No argument value for option $OPTARG"
+        usageInfo
+        ;;
+      *)
+      # Should not occur
+        echo "Unknown error while processing options"
+        ;;
+    esac
+done
+
+# Setup Vault access
+export ANSIBLE_LOG_PATH=/dev/null
+sec::getandStoreVaultAccess
+if [[ $? -ne 0 ]]; then
+  echo "ERROR" "Unable to setup vault access"
+  exit 1
+fi
+
+## Attempt to run a backup first
+results=$( backupRundeck -e $env )
+
+echo "Backup Results: $results"
+
+# Determine who is the active rundeck instance for prd/test
+if [[ "$env" == "prd" ]]; then
+   ping=$( curl -I http://$prd_pri_host:$rd_port/ 2>/dev/null | head -1 )
+   if [[ "$ping" == "HTTP/1.1 302 Found"* ]]; then
+     active_host=$prd_pri_host
+     backup_host=$prd_sec_host
+   else
+     active_host=$prd_sec_host
+     backup_host=$prd_pri_host
+   fi
+else
+   # Test
+   ping=$( curl -I http://$tst_pri_host:$rd_port/ 2>/dev/null | head -1 )
+   share_path=/psoft/admin/rundeck/test
+   if [[ "$ping" == "HTTP/1.1 302 Found"* ]]; then
+     active_host=$tst_pri_host
+     backup_host=$tst_sec_host
+     active_port=$rd_port
+     backup_port=$rd_sec_port
+     backup_path=/psoft/rundeck_test
+
+   else
+     active_host=$tst_sec_host
+     backup_host=$tst_pri_host
+     active_port=$rd_sec_port
+     backup_port=$rd_port
+     active_path=/psoft/rundeck_test
+   fi
+fi
+
+# Stop the active instance
+echo "Stopping active Rundeck instance..."
+if [[ "$active_port" == "$rd_sec_port" ]]; then
+  $SSH_CMD $active_host "export RDECK_BASE=$active_path && $active_path/server/sbin/rundeckd stop"
+else
+  $SSH_CMD $active_host "sudo systemctl stop rundeck.service"
+fi
+
+## Using lsyncd to sync logs in near real-time
+
+# disable log sync
+echo "Turn off log sync..."
+$SSH_CMD $active_host "sed -i '/sync /d' /psoft/lsyncd/lsync.conf"
+$SSH_CMD $active_host "sudo systemctl restart lsyncd.service"
+
+# enable backup log sync
+echo "Restoring logs and enabling log sync..."
+$SSH_CMD $backup_host "cp -pr $share_path/logs/* $backup_path/var/logs/rundeck/"
+$SSH_CMD $backup_host "echo \"sync { default.rsync, source = \\\"$backup_path/var/logs/rundeck\\\", target = \\\"$share_path/logs/\\\", rsync = { archive = true, append = true, _extra = { \\\"--bwlimit=5000\\\" } }}\" >> /psoft/lsyncd/lsync.conf"
+$SSH_CMD $backup_host "sudo systemctl restart lsyncd.service"
+
+# Import DB from backup
+echo "Restoring DB from backup on $backup_host..."
+sec::getGenSecurity "rundeck" rundeckPass
+export MYSQL_PWD="$rundeckPass"
+$SSH_CMD $backup_host "export MYSQL_PWD=\"$rundeckPass\" && mysql --socket=$backup_path/db/mysql.sock --user=rundeckuser rundeck < $share_path/db_backup/rundeck.dmp"
+echo "DB restore completed."
+
+# start backup rundeck instance
+echo "Starting backup Rundeck app..."
+if [[ "$backup_port" == "$rd_sec_port" ]]; then
+  $SSH_CMD $backup_host "export RDECK_BASE=$backup_path && $backup_path/server/sbin/rundeckd start"
+else
+  $SSH_CMD $backup_host "sudo systemctl start rundeck.service"
+fi
+
+# END

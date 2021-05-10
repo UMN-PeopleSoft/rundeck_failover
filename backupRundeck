@@ -1,0 +1,188 @@
+#!/bin/env bash
+#
+################################################################################
+##
+## File Name   : backupRundeck
+## Description : Backup all Rundeck instances and DBs.
+##               Then copy prod backup to secondary Rundeck instance.
+##              Built to support a test and prod pairs of Rundeck instances
+## Author      : Nate Werner
+## Created     : 10/8/2020
+################################################################################
+## Syntax      : backupRundeck -e <env-code> [-h]
+##
+## Parameters  :  -e  : Environment code
+##                -h  : Help
+##
+## Example     : backupRundeck
+##
+################################################################################
+
+##Global
+# ssh options to trust rundeck hosts
+SSH_CMD="ssh -o StrictHostKeyChecking=no"
+
+# load needed libraries
+source security.sh
+## common functions
+
+function usageInfo()
+{
+   echo "Usage:"
+   echo "   backupRundeck"
+   echo "     Backup all Rundeck instances and DBs, and prepare secondary instance"
+   echo "     -e        : environment code (prd/tst)"
+   echo "     -h        : Display this help"
+   echo
+   echo "Sample: backupRundeck"
+   echo
+   exit
+
+}
+
+######## Main program
+
+# setup hosts where rundeck is running, can be different than where this script runs
+prd_pri_host="host-01"
+prd_sec_host="host-02"
+tst_pri_host="testhost-01"
+tst_sec_host="testhost-02"
+
+active_host=""
+backup_host=""
+# location where rundeck is installed on primary host
+active_path=/psoft/rundeck
+# location where rundeck is installed on secondary host, in case it's different
+backup_path=/psoft/rundeck
+# NFS share where backups will be copied to
+share_path=/psoft/share/rundeck/prod
+# default env
+env="prd"
+
+rd_port=4440
+# secondary test Rundeck
+# running on same host, but different port
+rd_sec_port=4450
+active_port=$rd_port
+backup_port=$rd_port
+
+# get user's paramters
+while getopts ":he:" optname
+  do
+    case "$optname" in
+      "e")
+        env=$OPTARG
+        ;;
+      "h")
+        usageInfo
+        ;;
+      "?")
+        echo "Unknown option $OPTARG"
+        usageInfo
+        ;;
+      ":")
+        echo "No argument value for option $OPTARG"
+        usageInfo
+        ;;
+      *)
+      # Should not occur
+        echo "Unknown error while processing options"
+        ;;
+    esac
+done
+
+# Setup Vault access
+export ANSIBLE_LOG_PATH=/dev/null
+sec::getandStoreVaultAccess
+if [[ $? -ne 0 ]]; then
+  echo "ERROR" "Unable to setup vault access"
+  exit 1
+fi
+
+# Determine who is the active rundeck instance for prd/test
+if [[ "$env" == "prd" ]]; then
+   ping=$( curl -I http://$prd_pri_host:$rd_port/ 2>/dev/null | head -1 )
+   ping2=$( curl -I http://$prd_sec_host:$rd_port/ 2>/dev/null | head -1 )
+   # exit if we cannot determine the active host
+   if [[ "$ping" != "HTTP/1.1 302 Found"* && "$ping2" != "HTTP/1.1 302 Found"* ]]; then
+     echo "Both Rundeck instances are down, cannot determine active instance, existing"
+     exit
+   fi
+   if [[ "$ping" == "HTTP/1.1 302 Found"* ]]; then
+     active_host=$prd_pri_host
+     backup_host=$prd_sec_host
+   else
+     active_host=$prd_sec_host
+     backup_host=$prd_pri_host
+   fi
+else
+   # Test
+   ping=$( curl -I http://$tst_pri_host:$rd_port/ 2>/dev/null | head -1 )
+   ping2=$( curl -I http://$tst_sec_host:$rd_sec_port/ 2>/dev/null | head -1 )
+   # exit if we cannot determine the active host
+   if [[ "$ping" != "HTTP/1.1 302 Found"* && "$ping2" != "HTTP/1.1 302 Found"* ]]; then
+     echo "Both Rundeck instances are down, cannot determine active instance, existing"
+     exit
+   fi
+   share_path=/psoft/admin/rundeck/test
+   if [[ "$ping" == "HTTP/1.1 302 Found"* ]]; then
+     active_host=$tst_pri_host
+     backup_host=$tst_sec_host
+     active_port=$rd_port
+     backup_port=$rd_sec_port
+     backup_path=/psoft/rundeck_test
+
+   else
+     active_host=$tst_sec_host
+     backup_host=$tst_pri_host
+     active_port=$rd_sec_port
+     backup_port=$rd_port
+     active_path=/psoft/rundeck_test
+   fi
+fi
+
+echo "Backing up rundeck app on $active_host"
+# Copy app binaries and config to shared backup
+rsync -ax --exclude="log" --exclude="logs" $active_host:${active_path}/ ${share_path}/app_backup/
+
+# next copy to inactive only when primary is active.  We should never change rundeck if in DR mode
+if [[ "$active_host" == "$tst_pri_host" || "$active_host" == "$prd_pri_host" ]] ; then
+  echo "Cloning to secondary rundeck from $active_host to $backup_host"
+  $SSH_CMD $active_host rsync -ax --exclude="log" --exclude="logs" ${active_path}/ $backup_host:$backup_path/
+  $SSH_CMD $backup_host "sed -i 's/$active_host/$backup_host/g' $backup_path/etc/framework.properties"
+  $SSH_CMD $backup_host "sed -i 's/$active_host/$backup_host/g' $backup_path/etc/preferences.properties"
+  $SSH_CMD $backup_host "sed -i 's/$active_port/$backup_port/g' $backup_path/etc/framework.properties"
+  $SSH_CMD $backup_host "sed -i 's/$active_port/$backup_port/g' $backup_path/etc/preferences.properties"
+  if [[ "$backup_path" == *"test"* ]]; then
+    $SSH_CMD $backup_host "sed -i 's/psoft\/rundeck/psoft\/rundeck_test/g' $backup_path/server/sbin/rundeckd"
+    $SSH_CMD $backup_host "sed -i 's/psoft\/rundeck/psoft\/rundeck_test/g' $backup_path/server/config/jaas-ldap.conf"
+    $SSH_CMD $backup_host "sed -i 's/psoft\/rundeck/psoft\/rundeck_test/g' $backup_path/server/config/jaas-loginmodule.conf"
+    $SSH_CMD $backup_host "sed -i 's/psoft\/rundeck/psoft\/rundeck_test/g' $backup_path/server/config/log4j2.properties"
+    $SSH_CMD $backup_host "sed -i 's/psoft\/rundeck/psoft\/rundeck_test/g' $backup_path/server/config/log4j.properties"
+    $SSH_CMD $backup_host "sed -i 's/psoft\/rundeck/psoft\/rundeck_test/g' $backup_path/server/config/rundeck-config.properties"
+    $SSH_CMD $backup_host "sed -i 's/psoft\/rundeck/psoft\/rundeck_test/g' $backup_path/server/config/ssl.properties"
+    $SSH_CMD $backup_host "sed -i 's/psoft\/rundeck/psoft\/rundeck_test/g' $backup_path/etc/framework.properties"
+    $SSH_CMD $backup_host "sed -i 's/psoft\/rundeck/psoft\/rundeck_test/g' $backup_path/etc/preferences.properties"
+    $SSH_CMD $backup_host "sed -i 's/psoft\/rundeck/psoft\/rundeck_test/g' $backup_path/etc/profile"
+    $SSH_CMD $backup_host "sed -i 's/psoft\/rundeck/psoft\/rundeck_test/g' $backup_path/etc/project.properties"
+    $SSH_CMD $backup_host "sed -i 's/$active_port/$backup_port/g' $backup_path/server/sbin/rundeckd"
+    $SSH_CMD $backup_host "sed -i 's/localhost/localhost:3307/g' $backup_path/server/config/rundeck-config.properties"
+    # make sure to update IP address in config for backup host
+    backupIP=$( $SSH_CMD $backup_host ip addr | grep 10.33 | awk '{ print $2 }' | awk -F/ '{ print $1 }' )
+    $SSH_CMD $backup_host "sed -i \"s/server.address=.*/server.address=$backupIP/g\" $backup_path/server/config/rundeck-config.properties"
+
+  fi
+  # remove process file on backup since it's not running
+  $SSH_CMD $backup_host rm -f $backup_path/var/run/rundeckd.pid
+  $SSH_CMD $backup_host rm -rf $backup_path/var/lock/*
+  $SSH_CMD $backup_host rm -rf $backup_path/var/log/*
+fi
+
+# Run DB backup
+echo "Backing up DB on $active_host..."
+sec::getGenSecurity "rundeck" rundeckPass
+$SSH_CMD $active_host "export MYSQL_PWD=\"$rundeckPass\" && mysqldump --socket=$active_path/db/mysql.sock --user=rundeckuser --lock-tables --databases rundeck > $share_path/db_backup/rundeck.dmp"
+echo "Created second copy by date..."
+currentDate="$(date +%y%m%d_%H%M )"
+cp -p $share_path/db_backup/rundeck.dmp $share_path/db_backup/rundeck_$currentDate.dmp
+echo "Backup completed"
